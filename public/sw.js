@@ -1,4 +1,4 @@
-const CACHE = 'airventure-trip-board-v1.5'
+const CACHE = 'airventure-trip-board-v1.6-firebase'
 const SHELL = ['/', '/manifest.webmanifest', '/icon.svg']
 
 self.addEventListener('install', (event) => {

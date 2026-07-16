@@ -1,7 +1,7 @@
 {
   "name": "airventure-trip-board",
   "private": true,
-  "version": "1.5.0",
+  "version": "1.6.0",
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0",
@@ -9,9 +9,9 @@
     "preview": "vite preview --host 0.0.0.0"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.57.4",
     "react": "^19.1.1",
-    "react-dom": "^19.1.1"
+    "react-dom": "^19.1.1",
+    "firebase": "^12.0.0"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.7.0",

@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { browserLocalPersistence, onAuthStateChanged, setPersistence, signInAnonymously } from 'firebase/auth'
+import { collection, deleteDoc, doc, getDoc, onSnapshot, serverTimestamp, setDoc } from 'firebase/firestore'
 import {
   days,
   decisionForEvent,
@@ -9,7 +11,7 @@ import {
   formatTime,
   minutes,
 } from './data/schedule'
-import { hasSharedBackend, supabase } from './lib/supabase'
+import { auth, db, hasSharedBackend } from './lib/firebase'
 
 const TRIP_ID = import.meta.env.VITE_TRIP_ID || '9f1153d5-e0cd-4a8f-8f28-f78da5a6d6e5'
 const TRIP_NAME = import.meta.env.VITE_TRIP_NAME || 'AirVenture Weekend 2026'
@@ -63,6 +65,16 @@ function Icon({ name, size = 20 }) {
   return <svg {...common}>{paths[name]}</svg>
 }
 
+function normalizeFirebaseRecord(snapshot) {
+  const data = snapshot.data()
+  const normalizeTime = (value) => value?.toDate?.().toISOString?.() || value || null
+  return {
+    ...data,
+    created_at: normalizeTime(data.created_at),
+    updated_at: normalizeTime(data.updated_at),
+  }
+}
+
 function useTripData() {
   const [member, setMember] = useState(null)
   const [members, setMembers] = useState([])
@@ -71,6 +83,7 @@ function useTripData() {
   const [loading, setLoading] = useState(true)
   const [syncState, setSyncState] = useState(hasSharedBackend ? 'connecting' : 'local')
   const [error, setError] = useState('')
+  const [backendUserId, setBackendUserId] = useState(null)
 
   const hydrateLocal = useCallback(() => {
     const stored = loadLocalData()
@@ -81,42 +94,6 @@ function useTripData() {
     setMember((stored.members || []).find((item) => item.user_id === memberId) || null)
     setLoading(false)
     setSyncState('local')
-  }, [])
-
-  const fetchShared = useCallback(async (userId) => {
-    if (!supabase || !userId) return
-    const own = await supabase
-      .from('trip_members')
-      .select('*')
-      .eq('trip_id', TRIP_ID)
-      .eq('user_id', userId)
-      .maybeSingle()
-
-    if (own.error) throw own.error
-    setMember(own.data || null)
-
-    if (!own.data) {
-      setMembers([])
-      setVotes([])
-      setGroupChoices([])
-      setLoading(false)
-      setSyncState('ready')
-      return
-    }
-
-    const [memberResult, voteResult, choiceResult] = await Promise.all([
-      supabase.from('trip_members').select('*').eq('trip_id', TRIP_ID).order('created_at'),
-      supabase.from('votes').select('*').eq('trip_id', TRIP_ID),
-      supabase.from('group_choices').select('*').eq('trip_id', TRIP_ID),
-    ])
-    const firstError = memberResult.error || voteResult.error || choiceResult.error
-    if (firstError) throw firstError
-
-    setMembers(memberResult.data || [])
-    setVotes(voteResult.data || [])
-    setGroupChoices(choiceResult.data || [])
-    setLoading(false)
-    setSyncState('ready')
   }, [])
 
   useEffect(() => {
@@ -131,42 +108,132 @@ function useTripData() {
       }
     }
 
-    let mounted = true
-    let channel
-    async function start() {
-      try {
-        setSyncState('connecting')
-        const { data: sessionData } = await supabase.auth.getSession()
-        let session = sessionData.session
-        if (!session) {
-          const result = await supabase.auth.signInAnonymously()
-          if (result.error) throw result.error
-          session = result.data.session
-        }
-        if (!mounted || !session?.user) return
-        await fetchShared(session.user.id)
+    let cancelled = false
+    let unsubscribeAuth = () => {}
 
-        channel = supabase
-          .channel(`airventure-${TRIP_ID}`)
-          .on('postgres_changes', { event: '*', schema: 'public', table: 'trip_members', filter: `trip_id=eq.${TRIP_ID}` }, () => fetchShared(session.user.id))
-          .on('postgres_changes', { event: '*', schema: 'public', table: 'votes', filter: `trip_id=eq.${TRIP_ID}` }, () => fetchShared(session.user.id))
-          .on('postgres_changes', { event: '*', schema: 'public', table: 'group_choices', filter: `trip_id=eq.${TRIP_ID}` }, () => fetchShared(session.user.id))
-          .subscribe((status) => setSyncState(status === 'SUBSCRIBED' ? 'ready' : 'connecting'))
+    async function startAuthentication() {
+      try {
+        await setPersistence(auth, browserLocalPersistence)
+        if (cancelled) return
+        unsubscribeAuth = onAuthStateChanged(auth, async (user) => {
+          if (cancelled) return
+          if (user) {
+            setBackendUserId(user.uid)
+            setSyncState('connecting')
+            return
+          }
+          try {
+            await signInAnonymously(auth)
+          } catch (err) {
+            console.error(err)
+            if (!cancelled) {
+              setError(err.message || 'Could not create a Firebase session.')
+              setLoading(false)
+              setSyncState('error')
+            }
+          }
+        })
       } catch (err) {
         console.error(err)
-        if (mounted) {
-          setError(err.message || 'Could not connect to the shared trip board.')
+        if (!cancelled) {
+          setError(err.message || 'Could not initialize Firebase Authentication.')
           setLoading(false)
           setSyncState('error')
         }
       }
     }
-    start()
+
+    startAuthentication()
     return () => {
-      mounted = false
-      if (channel) supabase.removeChannel(channel)
+      cancelled = true
+      unsubscribeAuth()
     }
-  }, [fetchShared, hydrateLocal])
+  }, [hydrateLocal])
+
+  useEffect(() => {
+    if (!hasSharedBackend || !backendUserId) return undefined
+
+    const memberRef = doc(db, 'trips', TRIP_ID, 'members', backendUserId)
+    return onSnapshot(
+      memberRef,
+      (snapshot) => {
+        if (snapshot.exists()) {
+          setMember(normalizeFirebaseRecord(snapshot))
+        } else {
+          setMember(null)
+          setMembers([])
+          setVotes([])
+          setGroupChoices([])
+          setLoading(false)
+          setSyncState('ready')
+        }
+      },
+      (err) => {
+        console.error(err)
+        setError(err.message || 'Could not read your Firebase trip profile.')
+        setLoading(false)
+        setSyncState('error')
+      },
+    )
+  }, [backendUserId])
+
+  const joinedUserId = member?.user_id === backendUserId ? backendUserId : null
+
+  useEffect(() => {
+    if (!hasSharedBackend || !joinedUserId) return undefined
+
+    setSyncState('connecting')
+    const loaded = { members: false, votes: false, choices: false }
+    const markLoaded = (name) => {
+      loaded[name] = true
+      if (loaded.members && loaded.votes && loaded.choices) {
+        setLoading(false)
+        setSyncState('ready')
+      }
+    }
+    const handleError = (err) => {
+      console.error(err)
+      setError(err.message || 'Could not synchronize the Firebase trip board.')
+      setLoading(false)
+      setSyncState('error')
+    }
+
+    const unsubscribeMembers = onSnapshot(
+      collection(db, 'trips', TRIP_ID, 'members'),
+      (snapshot) => {
+        const records = snapshot.docs
+          .map(normalizeFirebaseRecord)
+          .sort((a, b) => String(a.created_at || '').localeCompare(String(b.created_at || '')))
+        setMembers(records)
+        markLoaded('members')
+      },
+      handleError,
+    )
+
+    const unsubscribeVotes = onSnapshot(
+      collection(db, 'trips', TRIP_ID, 'votes'),
+      (snapshot) => {
+        setVotes(snapshot.docs.map(normalizeFirebaseRecord))
+        markLoaded('votes')
+      },
+      handleError,
+    )
+
+    const unsubscribeChoices = onSnapshot(
+      collection(db, 'trips', TRIP_ID, 'groupChoices'),
+      (snapshot) => {
+        setGroupChoices(snapshot.docs.map(normalizeFirebaseRecord))
+        markLoaded('choices')
+      },
+      handleError,
+    )
+
+    return () => {
+      unsubscribeMembers()
+      unsubscribeVotes()
+      unsubscribeChoices()
+    }
+  }, [joinedUserId])
 
   async function saveName(displayName) {
     const cleanName = displayName.trim().slice(0, 40)
@@ -186,16 +253,19 @@ function useTripData() {
       return
     }
 
+    if (!backendUserId) throw new Error('Firebase is still connecting. Try again in a moment.')
     setSyncState('saving')
-    const { data: sessionData } = await supabase.auth.getSession()
-    const userId = sessionData.session?.user?.id
-    if (!userId) throw new Error('No active user session.')
-    const result = await supabase.from('trip_members').upsert(
-      { trip_id: TRIP_ID, user_id: userId, display_name: cleanName },
-      { onConflict: 'trip_id,user_id' },
-    )
-    if (result.error) throw result.error
-    await fetchShared(userId)
+    const memberRef = doc(db, 'trips', TRIP_ID, 'members', backendUserId)
+    const existing = await getDoc(memberRef)
+    const record = {
+      trip_id: TRIP_ID,
+      user_id: backendUserId,
+      display_name: cleanName,
+      updated_at: serverTimestamp(),
+    }
+    if (!existing.exists()) record.created_at = serverTimestamp()
+    await setDoc(memberRef, record, { merge: true })
+    setSyncState('connecting')
   }
 
   async function setVote(eventId, choice) {
@@ -214,29 +284,37 @@ function useTripData() {
       return
     }
 
+    const previousVotes = votes
     setVotes((current) => {
       const remaining = current.filter((vote) => !(vote.user_id === member.user_id && vote.event_id === eventId))
       return nextChoice ? [...remaining, { trip_id: TRIP_ID, user_id: member.user_id, event_id: eventId, choice: nextChoice }] : remaining
     })
 
-    const result = nextChoice
-      ? await supabase.from('votes').upsert(
-          { trip_id: TRIP_ID, user_id: member.user_id, event_id: eventId, choice: nextChoice, updated_at: new Date().toISOString() },
-          { onConflict: 'trip_id,user_id,event_id' },
-        )
-      : await supabase.from('votes').delete().eq('trip_id', TRIP_ID).eq('user_id', member.user_id).eq('event_id', eventId)
-    if (result.error) {
-      setError(result.error.message)
-      await fetchShared(member.user_id)
+    setSyncState('saving')
+    const voteRef = doc(db, 'trips', TRIP_ID, 'votes', `${member.user_id}--${eventId}`)
+    try {
+      if (nextChoice) {
+        await setDoc(voteRef, {
+          trip_id: TRIP_ID,
+          user_id: member.user_id,
+          event_id: eventId,
+          choice: nextChoice,
+          updated_at: serverTimestamp(),
+        })
+      } else {
+        await deleteDoc(voteRef)
+      }
+      setSyncState('ready')
+    } catch (err) {
+      setVotes(previousVotes)
+      setError(err.message || 'Could not save your vote.')
+      setSyncState('error')
     }
   }
 
   async function setGroupChoice(decisionId, eventId) {
     if (!member) return
 
-    // Group picks are event-level and fully reversible. More than one overlapping
-    // event may be selected as an explicit override, so selecting a new event never
-    // removes another event automatically.
     const clear = groupChoices.some((item) => item.event_id === eventId)
     const previousChoices = groupChoices
     const record = {
@@ -250,7 +328,6 @@ function useTripData() {
       ? groupChoices.filter((item) => item.event_id !== eventId)
       : [...groupChoices.filter((item) => item.event_id !== eventId), record]
 
-    // Optimistic update keeps Decisions and Schedule synchronized immediately.
     setGroupChoices(nextChoices)
 
     if (!hasSharedBackend) {
@@ -261,16 +338,18 @@ function useTripData() {
     }
 
     setSyncState('saving')
-    const result = clear
-      ? await supabase.from('group_choices').delete().eq('trip_id', TRIP_ID).eq('event_id', eventId)
-      : await supabase.from('group_choices').upsert(record, { onConflict: 'trip_id,event_id' })
-
-    if (result.error) {
-      setGroupChoices(previousChoices)
-      setError(result.error.message)
-      await fetchShared(member.user_id)
-    } else {
+    const choiceRef = doc(db, 'trips', TRIP_ID, 'groupChoices', eventId)
+    try {
+      if (clear) {
+        await deleteDoc(choiceRef)
+      } else {
+        await setDoc(choiceRef, { ...record, updated_at: serverTimestamp() })
+      }
       setSyncState('ready')
+    } catch (err) {
+      setGroupChoices(previousChoices)
+      setError(err.message || 'Could not update the group selection.')
+      setSyncState('error')
     }
   }
 
@@ -291,18 +370,13 @@ function useTripData() {
     }
 
     setSyncState('saving')
-    const result = await supabase
-      .from('group_choices')
-      .delete()
-      .eq('trip_id', TRIP_ID)
-      .in('event_id', ids)
-
-    if (result.error) {
-      setGroupChoices(previousChoices)
-      setError(result.error.message)
-      await fetchShared(member.user_id)
-    } else {
+    try {
+      await Promise.all(ids.map((eventId) => deleteDoc(doc(db, 'trips', TRIP_ID, 'groupChoices', eventId))))
       setSyncState('ready')
+    } catch (err) {
+      setGroupChoices(previousChoices)
+      setError(err.message || 'Could not clear the group selections.')
+      setSyncState('error')
     }
   }
 
@@ -952,7 +1026,7 @@ function GroupView({ member, members, votes, groupChoices, onEditName }) {
         <Icon name="wifi" />
         <div>
           <strong>{hasSharedBackend ? 'Shared realtime mode' : 'Local demo mode'}</strong>
-          <p>{hasSharedBackend ? 'Changes update across your group’s phones through Supabase.' : 'This copy works on one device. Add Supabase environment variables before sending the link to friends.'}</p>
+          <p>{hasSharedBackend ? 'Changes update across your group’s phones through Firebase Firestore.' : 'This copy works on one device. Add Firebase environment variables before sending the link to friends.'}</p>
         </div>
       </section>
     </main>

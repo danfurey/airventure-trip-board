@@ -1,92 +1,89 @@
 # AirVenture Trip Board
 
-A mobile-first shared schedule for EAA AirVenture 2026. It converts every fixed-time overlap into a **decision point**, lets each traveler vote on events, and allows the group to set a live choice during the trip.
+A mobile-first shared schedule for EAA AirVenture 2026. It converts fixed-time overlaps into decision points, lets each traveler vote, and allows the group to make reversible selections and intentional conflict overrides.
 
-## Version 1.5
+## Version 1.6 — Firebase
 
-- Removes the introductory “Live decision board” and “Complete trip schedule” banners.
-- Uses a permanent dark color scheme across Decisions, Schedule, Group, dialogs, and the mobile timeline.
-- Retains the v1.4 group-pick and override behavior.
+- Replaces Supabase with Firebase Authentication and Cloud Firestore.
+- Uses anonymous Firebase accounts so friends do not need passwords.
+- Synchronizes names, votes, group selections, clears, and overrides across phones in real time.
+- Retains local-device demo mode when Firebase is not configured.
+- Retains the dark theme, visual timeline, conflict filtering, demonstration exceptions, and override behavior from v1.5.
 
-## What is included
+## Architecture
 
-- Saturday and Sunday schedules from the provided screenshots
-- Mobile decision board for every fixed-time overlap
-- Individual **Want it / Maybe / Skip** votes
-- Reversible event-level **group picks**, including intentional conflicting overrides
-- Live updates across phones when Supabase is connected
-- Color-coded, horizontally scrollable timeline inside the Schedule tab
-- Conflict-intensity strip showing clear, overlapping, and heavily conflicted periods
-- Timeline bars that react to Want it / Maybe / Skip votes and group picks
-- Group picks automatically hide overlapping non-demonstration events from the timeline; demonstration events and selected overrides remain visible
-- Flexible-window labels for long-running displays
-- Installable PWA shell for easier phone access
-- Local demo mode when no database is configured
+- **GitHub:** source code
+- **Vercel:** website hosting and deployments
+- **Firebase Authentication:** anonymous identity for each phone
+- **Cloud Firestore:** shared group data and realtime updates
 
-Two screenshot entries had incomplete times and remain marked **TBD**:
-
-- How One Little Rivet Changed My Life
-- Mission Marge
+Vercel continues to host the app. Firebase is used only for authentication and shared data.
 
 ## Deploy the visual demo immediately
 
-1. Push this folder to a GitHub repository, or drag the folder/ZIP into Vercel Drop.
-2. Import the project in Vercel.
-3. Vercel detects Vite automatically. The build command is `npm run build`; the output directory is `dist`.
+1. Push this folder to GitHub.
+2. Import the repository into Vercel.
+3. Use the Vite preset, `npm run build`, and output directory `dist`.
 4. Deploy.
 
-Without Supabase variables, the app works in **Device demo** mode. Votes are stored only in that browser.
+Without Firebase variables, the app runs in **Device demo** mode. Each browser stores its own votes and selections.
 
-## Enable shared live updates
+## Enable shared Firebase updates
 
-### 1. Create the Supabase project
+### 1. Create or select a Firebase project
 
-Create a Supabase project, then open **SQL Editor** and run:
+Open the Firebase console and select the project you want to use. Add a **Web app** to the project. Firebase displays a configuration object containing values such as `apiKey`, `authDomain`, `projectId`, and `appId`.
 
-`supabase/schema.sql`
+### 2. Enable Anonymous Authentication
 
-If you already installed v1.3 or earlier, run this migration once instead:
+In **Firebase Console → Authentication → Sign-in method**, enable **Anonymous**. Each phone then receives its own persistent anonymous user ID without requiring an email address or password.
 
-`supabase/migrate-v1.4.sql`
+### 3. Create Cloud Firestore
 
-### 2. Enable anonymous users
+In **Firebase Console → Firestore Database**, create the database. For production, select the region nearest the group and do not leave the database in unrestricted test mode.
 
-In Supabase Authentication settings, enable **Anonymous Sign-Ins**. Each phone receives an anonymous user ID without requiring email addresses or passwords.
+Open the **Rules** tab and replace the rules with the contents of:
 
-### 3. Add Vercel environment variables
+`firebase/firestore.rules`
 
-Copy `.env.example` values into **Vercel → Project Settings → Environment Variables**:
+Then publish the rules.
 
-- `VITE_SUPABASE_URL`
-- `VITE_SUPABASE_PUBLISHABLE_KEY`
-- `VITE_TRIP_ID`
-- `VITE_TRIP_NAME`
+### 4. Add Vercel environment variables
 
-Generate a new UUID for `VITE_TRIP_ID`. Keep it stable after sharing the app because it identifies this trip's data.
+In the Firebase project settings, find **Your apps → SDK setup and configuration → Config**. Copy the matching values into Vercel:
 
-### 4. Redeploy
+- `VITE_FIREBASE_API_KEY` ← `apiKey`
+- `VITE_FIREBASE_AUTH_DOMAIN` ← `authDomain`
+- `VITE_FIREBASE_PROJECT_ID` ← `projectId`
+- `VITE_FIREBASE_STORAGE_BUCKET` ← `storageBucket`
+- `VITE_FIREBASE_MESSAGING_SENDER_ID` ← `messagingSenderId`
+- `VITE_FIREBASE_APP_ID` ← `appId`
+- `VITE_TRIP_ID` ← keep `9f1153d5-e0cd-4a8f-8f28-f78da5a6d6e5`, or use another stable UUID
+- `VITE_TRIP_NAME` ← `AirVenture Weekend 2026`
 
-Redeploy the project. The header should show **Live sync**. Send the Vercel URL to the group. Each person enters a name once, then votes and group picks update on all phones.
+The Firebase web configuration identifies the Firebase project; it is not an administrative secret. Security is enforced by Firebase Authentication and Firestore rules. Never put a Firebase Admin private key or service-account JSON in `VITE_` variables.
+
+### 5. Redeploy
+
+Redeploy the Vercel project after adding the variables. The app header should show **Live sync**. Send the Vercel URL to the group.
+
+## Firestore data layout
+
+The app creates these collections automatically after the first person joins:
+
+```text
+trips/{tripId}/members/{firebaseUserId}
+trips/{tripId}/votes/{firebaseUserId}--{eventId}
+trips/{tripId}/groupChoices/{eventId}
+```
+
+There is no Supabase-to-Firebase migration included. If the Supabase version was not used by the group yet, no migration is needed.
 
 ## Security boundary
 
-This is a low-risk private-trip MVP, not a hardened public product. Anonymous users can join if they possess the trip URL and embedded trip ID. Row Level Security prevents users from editing other people's individual votes, but any trip member can change the group pick. For a larger or public product, add email or passkey authentication and invitation records.
-
-## Edit the schedule
-
-The schedule is in:
-
-`src/data/schedule.js`
-
-Each event supports:
-
-- `flexible: true` for a long drop-in window that should not generate hard decision points
-- `anchor: true` for major fixed events such as the air shows
-- `pending: true` when the time is not yet confirmed
+This is a private-trip MVP. Anyone with the public trip URL can anonymously join the board. Firestore rules prevent users from editing another person's name or vote, while any authenticated participant can set or clear group choices. For broader public use, add invitations and stronger sign-in.
 
 ## Local development
-
-On Windows PowerShell:
 
 ```powershell
 cd C:\path\to\the\project
@@ -94,25 +91,25 @@ npm install
 npm run dev
 ```
 
-Then open the local URL Vite displays, normally `http://localhost:5173`.
-
-The included `package-lock.json` uses the public npm registry. If npm ever reports an inaccessible registry, run:
-
-```powershell
-npm config set registry https://registry.npmjs.org/
-Remove-Item package-lock.json
-npm install
-```
+Open the Vite URL, normally `http://localhost:5173`. To test shared mode locally, copy `.env.example` to `.env.local` and enter your Firebase web configuration.
 
 Production check:
 
-```bash
+```powershell
 npm run build
 npm run preview
 ```
 
-## Group-pick and override behavior (v1.4)
+## Updating GitHub and Vercel
 
-Group picks are reversible and stored by event. Selecting an event grays out conflicting non-demonstration choices in the Decisions tab, but does not disable them. Choosing **Add override** keeps both conflicting group picks active. Both picks remain visible in the Schedule timeline and are marked **OVR**. Unselected conflicting events remain hidden from the timeline, demonstrations remain visible, and **Restore all** clears the current day's selections.
+```powershell
+git add .
+git commit -m "Replace Supabase with Firebase"
+git push
+```
 
-Existing Supabase installations must run `supabase/migrate-v1.4.sql` once so the database can store more than one selected event within the same decision period.
+Vercel automatically redeploys the connected repository after the push.
+
+## Schedule source
+
+Edit events in `src/data/schedule.js`.
