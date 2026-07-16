@@ -1,0 +1,17 @@
+{
+  "name": "AirVenture Trip Board",
+  "short_name": "AirVenture",
+  "description": "Shared schedule, votes, and live decision points for AirVenture 2026.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#071019",
+  "theme_color": "#071019",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
