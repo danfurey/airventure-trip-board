@@ -2,16 +2,42 @@
 
 A mobile-first shared schedule for EAA AirVenture 2026. It converts fixed-time overlaps into decision points and lets the group make reversible selections and intentional conflict overrides.
 
-## Version 1.8 — Fast startup
+## Version 2.2 — schedule-only decision flow
+
+- Removes the separate Decisions tab and bottom navigation.
+- Uses the Schedule timeline as the primary decision interface.
+- Renames `Want it` to `Attend`.
+- Selecting **Attend** immediately becomes the shared group choice and removes conflicting non-protected events from the timeline.
+- Keeps existing conflict overrides active; grayed events in the full schedule can be restored with **Override & attend**.
+- Grays conflicting events in the full schedule without disabling them.
+- Keeps demonstrations, flexible displays, and air shows visible during conflicts.
+- Places air shows in the featured lanes at the top of the timeline while retaining their blue Air Show color.
+- Treats flexible displays and air shows as non-blocking windows, so attending them does not erase the rest of the day.
+- Saves the Attend/Maybe/Skip decision and the active group choice in one atomic Firestore batch.
+
+## Version 2.1 — Firebase connection visibility
 
 - Shows the bundled schedule immediately instead of blocking on Firebase.
-- Restores the last synchronized choices from local browser storage while the live connection starts.
-- Replaces cached choices with the current Firestore state as soon as it arrives.
-- Keeps Firebase Authentication and Firestore synchronization in the background.
-- Prevents edits during the brief authentication handshake.
+- Shows last-saved selections only as provisional data while Firebase connects.
+- Enables Firestore persistent cache with multi-tab support when the browser supports it.
+- Uses snapshot metadata to distinguish cache results from server-confirmed results.
+- Does not let an empty cache-only snapshot erase previously saved selections.
+- Treats the first server-backed snapshots for both collections as authoritative, including valid empty collections.
+- Keeps editing locked until Firebase confirms the current shared state.
+- Uses optimistic updates only after live synchronization is established.
+- Shows clear `Connecting`, `Cached`, `Live sync`, `Saving`, `Offline`, and `Sync error` states.
 - Restricts the service worker to same-origin app files so it cannot intercept Firebase requests.
-- Uses cached app assets on repeat visits while refreshing them in the background.
 - Retains the single shared board, dark theme, timeline, conflict filtering, demonstration exceptions, and overrides.
+
+
+## Version 2.1 — Firebase connectivity fix
+
+- Uses a direct Firestore server probe instead of waiting indefinitely for listener metadata.
+- Uses deterministic anonymous sign-in through `authStateReady()` and `signInAnonymously()`.
+- Forces Firestore long polling for compatibility with Firefox, antivirus software, VPNs, and buffering proxies.
+- Uses memory cache; localStorage is only a provisional display until Firebase confirms the server state.
+- Shows the current connection step, elapsed time, Firebase error code, and a manual Retry now control.
+- Firebase remains authoritative and editing stays locked until server data is confirmed.
 
 ## Architecture
 
@@ -63,8 +89,16 @@ npm run dev
 
 ```powershell
 git add .
-git commit -m "Use one shared trip board"
+git commit -m "Use schedule-only decision flow"
 git push
 ```
 
 Vercel redeploys automatically after the push.
+
+
+## Version 2.3 — Schedule and map tabs
+
+- Restores two navigation tabs: Schedule and Map.
+- Embeds the official AirVenture visitor map directly in the app.
+- Adds map zoom controls and a scrollable mobile map viewport.
+- Removes the extra timeline and conflict instruction text requested for the schedule view.

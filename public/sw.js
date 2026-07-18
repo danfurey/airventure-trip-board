@@ -1,5 +1,5 @@
-const CACHE = 'airventure-trip-board-v1.8-fast-start'
-const SHELL = ['/', '/manifest.webmanifest', '/icon.svg']
+const CACHE = 'airventure-trip-board-v2.3-map-tab'
+const SHELL = ['/', '/manifest.webmanifest', '/icon.svg', '/airventure-visitors-map-2026.webp']
 
 self.addEventListener('install', (event) => {
   event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(SHELL)))

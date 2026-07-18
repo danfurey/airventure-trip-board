@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
-import { browserLocalPersistence, onAuthStateChanged, setPersistence, signInAnonymously } from 'firebase/auth'
-import { collection, deleteDoc, doc, onSnapshot, serverTimestamp, setDoc } from 'firebase/firestore'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { browserLocalPersistence, setPersistence, signInAnonymously } from 'firebase/auth'
+import { collection, deleteDoc, disableNetwork, doc, enableNetwork, getDocsFromServer, onSnapshot, serverTimestamp, setDoc, writeBatch } from 'firebase/firestore'
 import {
   days,
   decisionForEvent,
@@ -11,14 +11,14 @@ import {
   formatTime,
   minutes,
 } from './data/schedule'
-import { auth, db, hasSharedBackend } from './lib/firebase'
+import { auth, db, firebaseProjectId, hasSharedBackend } from './lib/firebase'
 
 const TRIP_ID = import.meta.env.VITE_TRIP_ID || '9f1153d5-e0cd-4a8f-8f28-f78da5a6d6e5'
 const TRIP_NAME = import.meta.env.VITE_TRIP_NAME || 'AirVenture Weekend 2026'
 const LOCAL_KEY = `airventure-trip-board:${TRIP_ID}`
 
 const choiceLabels = {
-  going: 'Want it',
+  going: 'Attend',
   maybe: 'Maybe',
   skip: 'Skip',
 }
@@ -77,20 +77,53 @@ function normalizeFirebaseRecord(snapshot) {
 
 function useTripData() {
   const sharedMember = useMemo(() => ({ trip_id: TRIP_ID, user_id: 'shared-board', display_name: 'Shared board' }), [])
-  const [votes, setVotes] = useState(() => loadLocalData().votes || [])
-  const [groupChoices, setGroupChoices] = useState(() => loadLocalData().groupChoices || [])
-  const [loading, setLoading] = useState(false)
-  const [syncState, setSyncState] = useState(hasSharedBackend ? 'connecting' : 'local')
+  const initialData = useMemo(() => loadLocalData(), [])
+  const [votes, setVotes] = useState(() => initialData.votes || [])
+  const [groupChoices, setGroupChoices] = useState(() => initialData.groupChoices || [])
   const [error, setError] = useState('')
+  const [connectionIssue, setConnectionIssue] = useState('')
   const [backendUserId, setBackendUserId] = useState(null)
+  const [serverReady, setServerReady] = useState(!hasSharedBackend)
+  const [cacheSeen, setCacheSeen] = useState(Boolean((initialData.votes || []).length || (initialData.groupChoices || []).length))
+  const [connectionPhase, setConnectionPhase] = useState(hasSharedBackend ? 'auth' : 'local')
+  const [connectionStartedAt, setConnectionStartedAt] = useState(() => Date.now())
+  const [connectionElapsed, setConnectionElapsed] = useState(0)
+  const [connectionAttempt, setConnectionAttempt] = useState(0)
+  const [isOnline, setIsOnline] = useState(() => navigator.onLine)
+  const [listenerFromCache, setListenerFromCache] = useState(hasSharedBackend)
+  const [listenerHasPendingWrites, setListenerHasPendingWrites] = useState(false)
+  const [pendingWrites, setPendingWrites] = useState(0)
+  const serverReadyRef = useRef(!hasSharedBackend)
+  const votesRef = useRef(votes)
+  const groupChoicesRef = useRef(groupChoices)
+
+  useEffect(() => { votesRef.current = votes }, [votes])
+  useEffect(() => { groupChoicesRef.current = groupChoices }, [groupChoices])
 
   const hydrateLocal = useCallback(() => {
     const stored = loadLocalData()
     setVotes(stored.votes || [])
     setGroupChoices(stored.groupChoices || [])
-    setLoading(false)
-    setSyncState('local')
   }, [])
+
+  useEffect(() => {
+    const handleOnline = () => setIsOnline(true)
+    const handleOffline = () => setIsOnline(false)
+    window.addEventListener('online', handleOnline)
+    window.addEventListener('offline', handleOffline)
+    return () => {
+      window.removeEventListener('online', handleOnline)
+      window.removeEventListener('offline', handleOffline)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!hasSharedBackend || serverReady || error) return undefined
+    const updateElapsed = () => setConnectionElapsed(Math.max(0, Math.floor((Date.now() - connectionStartedAt) / 1000)))
+    updateElapsed()
+    const intervalId = window.setInterval(updateElapsed, 1000)
+    return () => window.clearInterval(intervalId)
+  }, [connectionStartedAt, error, serverReady])
 
   useEffect(() => {
     if (!hasSharedBackend) {
@@ -105,124 +138,284 @@ function useTripData() {
     }
 
     let cancelled = false
-    let unsubscribeAuth = () => {}
+    let unsubscribeVotes = () => {}
+    let unsubscribeChoices = () => {}
+    let noResponseTimer = 0
+    const serverConfirmed = { votes: false, choices: false }
+    const sourceFromCache = { votes: true, choices: true }
+    const sourceHasPendingWrites = { votes: false, choices: false }
 
-    async function startAuthentication() {
+    function friendlyConnectionError(err) {
+      const code = err?.code || 'unknown'
+      const messages = {
+        'auth/operation-not-allowed': 'Anonymous sign-in is disabled in Firebase Authentication.',
+        'auth/network-request-failed': 'Firebase Authentication could not reach Google. Check the network, VPN, firewall, or browser privacy settings.',
+        'permission-denied': 'Firestore rejected the request. Publish the included Firestore rules and confirm Anonymous Authentication is enabled.',
+        'unauthenticated': 'Firestore did not receive a valid Firebase user session.',
+        'failed-precondition': 'Firestore is not ready for this project. Confirm that the Firestore database was created.',
+        'not-found': 'The Firestore database or requested project could not be found. Check the Firebase project ID.',
+        'unavailable': 'Firestore is currently unreachable from this browser or network.',
+        'deadline-exceeded': 'Firestore did not respond before the request deadline.',
+      }
+      return `${messages[code] || err?.message || 'Firebase connection failed.'} [${code}]`
+    }
+
+    function isFatalConnectionError(err) {
+      return ['auth/operation-not-allowed', 'permission-denied', 'unauthenticated', 'failed-precondition', 'not-found', 'invalid-argument'].includes(err?.code)
+    }
+
+    function applyRecords(name, records) {
+      if (name === 'votes') {
+        votesRef.current = records
+        setVotes(records)
+        cacheSharedData({ votes: records })
+      } else {
+        groupChoicesRef.current = records
+        setGroupChoices(records)
+        cacheSharedData({ groupChoices: records })
+      }
+    }
+
+    function confirmServer(name, records) {
+      if (cancelled) return
+      applyRecords(name, records)
+      serverConfirmed[name] = true
+      sourceFromCache[name] = false
+      setListenerFromCache(sourceFromCache.votes || sourceFromCache.choices)
+
+      if (serverConfirmed.votes && serverConfirmed.choices) {
+        serverReadyRef.current = true
+        setServerReady(true)
+        setConnectionPhase('live')
+        setConnectionIssue('')
+        setError('')
+        window.clearTimeout(noResponseTimer)
+      }
+    }
+
+    function handleSnapshot(name, snapshot) {
+      if (cancelled) return
+      sourceFromCache[name] = snapshot.metadata.fromCache
+      sourceHasPendingWrites[name] = snapshot.metadata.hasPendingWrites
+      setListenerFromCache(sourceFromCache.votes || sourceFromCache.choices)
+      setListenerHasPendingWrites(sourceHasPendingWrites.votes || sourceHasPendingWrites.choices)
+
+      const records = snapshot.docs.map(normalizeFirebaseRecord)
+      if (!snapshot.metadata.fromCache) {
+        confirmServer(name, records)
+      } else {
+        setCacheSeen(true)
+        // Before server confirmation, localStorage remains the provisional display.
+        // After live sync, optimistic writes are already applied directly by the UI.
+      }
+    }
+
+    function handleFirestoreError(err) {
+      console.error('Firestore connection error:', err)
+      const message = friendlyConnectionError(err)
+      if (isFatalConnectionError(err)) {
+        setConnectionPhase('error')
+        setError(message)
+      } else {
+        setConnectionPhase('retrying')
+        setConnectionIssue(message)
+      }
+    }
+
+    async function connect() {
+      serverReadyRef.current = false
+      setServerReady(false)
+      setBackendUserId(null)
+      setError('')
+      setConnectionIssue('')
+      setConnectionPhase('auth')
+      setConnectionStartedAt(Date.now())
+      setConnectionElapsed(0)
+      setListenerFromCache(true)
+
       try {
         await setPersistence(auth, browserLocalPersistence)
+        await auth.authStateReady()
         if (cancelled) return
-        unsubscribeAuth = onAuthStateChanged(auth, async (user) => {
-          if (cancelled) return
-          if (user) {
-            setBackendUserId(user.uid)
-            setSyncState('connecting')
-            return
-          }
-          try {
-            await signInAnonymously(auth)
-          } catch (err) {
-            console.error(err)
-            if (!cancelled) {
-              setError(err.message || 'Could not connect to the shared board.')
-              setLoading(false)
-              setSyncState('error')
-            }
-          }
-        })
+
+        let user = auth.currentUser
+        if (!user) {
+          const credential = await signInAnonymously(auth)
+          user = credential.user
+        }
+        if (cancelled) return
+
+        setBackendUserId(user.uid)
+        setConnectionPhase('firestore')
+        setConnectionStartedAt(Date.now())
+        setConnectionElapsed(0)
+
+        await enableNetwork(db)
+        if (cancelled) return
+
+        const votesCollection = collection(db, 'trips', TRIP_ID, 'votes')
+        const choicesCollection = collection(db, 'trips', TRIP_ID, 'groupChoices')
+
+        unsubscribeVotes = onSnapshot(
+          votesCollection,
+          { includeMetadataChanges: true },
+          (snapshot) => handleSnapshot('votes', snapshot),
+          handleFirestoreError,
+        )
+        unsubscribeChoices = onSnapshot(
+          choicesCollection,
+          { includeMetadataChanges: true },
+          (snapshot) => handleSnapshot('choices', snapshot),
+          handleFirestoreError,
+        )
+
+        // One-shot server reads make startup deterministic and expose rules,
+        // project, or database errors instead of waiting forever on listeners.
+        getDocsFromServer(votesCollection)
+          .then((snapshot) => confirmServer('votes', snapshot.docs.map(normalizeFirebaseRecord)))
+          .catch(handleFirestoreError)
+        getDocsFromServer(choicesCollection)
+          .then((snapshot) => confirmServer('choices', snapshot.docs.map(normalizeFirebaseRecord)))
+          .catch(handleFirestoreError)
+
+        noResponseTimer = window.setTimeout(() => {
+          if (cancelled || serverReadyRef.current) return
+          setConnectionPhase('retrying')
+          setConnectionIssue(
+            `No Firestore server response after 12 seconds. Firebase is configured for compatibility mode and is still listening. Project: ${firebaseProjectId || 'unknown'}.`
+          )
+        }, 12000)
       } catch (err) {
-        console.error(err)
-        if (!cancelled) {
-          setError(err.message || 'Could not initialize the shared board.')
-          setLoading(false)
-          setSyncState('error')
+        console.error('Firebase startup error:', err)
+        const message = friendlyConnectionError(err)
+        if (isFatalConnectionError(err) || String(err?.code || '').startsWith('auth/')) {
+          setConnectionPhase('error')
+          setError(message)
+        } else {
+          setConnectionPhase('retrying')
+          setConnectionIssue(message)
         }
       }
     }
 
-    startAuthentication()
+    connect()
     return () => {
       cancelled = true
-      unsubscribeAuth()
-    }
-  }, [hydrateLocal])
-
-  useEffect(() => {
-    if (!hasSharedBackend || !backendUserId) return undefined
-
-    setSyncState('connecting')
-    const loaded = { votes: false, choices: false }
-    const markLoaded = (name) => {
-      loaded[name] = true
-      if (loaded.votes && loaded.choices) {
-        setLoading(false)
-        setSyncState('ready')
-      }
-    }
-    const handleError = (err) => {
-      console.error(err)
-      setError(err.message || 'Could not synchronize the shared trip board.')
-      setLoading(false)
-      setSyncState('error')
-    }
-
-    const unsubscribeVotes = onSnapshot(
-      collection(db, 'trips', TRIP_ID, 'votes'),
-      (snapshot) => {
-        const nextVotes = snapshot.docs.map(normalizeFirebaseRecord)
-        setVotes(nextVotes)
-        cacheSharedData({ votes: nextVotes })
-        markLoaded('votes')
-      },
-      handleError,
-    )
-
-    const unsubscribeChoices = onSnapshot(
-      collection(db, 'trips', TRIP_ID, 'groupChoices'),
-      (snapshot) => {
-        const nextChoices = snapshot.docs.map(normalizeFirebaseRecord)
-        setGroupChoices(nextChoices)
-        cacheSharedData({ groupChoices: nextChoices })
-        markLoaded('choices')
-      },
-      handleError,
-    )
-
-    return () => {
+      window.clearTimeout(noResponseTimer)
       unsubscribeVotes()
       unsubscribeChoices()
     }
-  }, [backendUserId])
+  }, [connectionAttempt, hydrateLocal])
 
-  async function setVote(eventId, choice) {
-    if (hasSharedBackend && !backendUserId) {
-      setError('The shared board is still connecting. Try again in a moment.')
+  const retryFirebase = useCallback(async () => {
+    if (!hasSharedBackend) return
+    setError('')
+    setConnectionIssue('')
+    setConnectionPhase('restarting')
+    setConnectionStartedAt(Date.now())
+    setConnectionElapsed(0)
+    serverReadyRef.current = false
+    setServerReady(false)
+    try {
+      await disableNetwork(db)
+      await enableNetwork(db)
+    } catch (err) {
+      console.warn('Firestore network restart did not complete cleanly:', err)
+    }
+    setConnectionAttempt((attempt) => attempt + 1)
+  }, [])
+
+  const canEdit = !hasSharedBackend || serverReady
+  const syncState = useMemo(() => {
+    if (!hasSharedBackend) return 'local'
+    if (error) return 'error'
+    if (!isOnline) return 'offline'
+    if (!serverReady) {
+      if (connectionIssue || connectionElapsed >= 12) return 'retrying'
+      return cacheSeen ? 'cached' : 'connecting'
+    }
+    if (pendingWrites > 0 || listenerHasPendingWrites) return 'saving'
+    if (listenerFromCache) return 'reconnecting'
+    return 'ready'
+  }, [cacheSeen, connectionElapsed, connectionIssue, error, isOnline, listenerFromCache, listenerHasPendingWrites, pendingWrites, serverReady])
+
+  const syncDetail = useMemo(() => {
+    if (!hasSharedBackend) return 'Firebase is not configured; changes stay on this device.'
+    if (error) return error
+    if (!isOnline) return 'The browser reports that this device is offline.'
+    if (connectionIssue) return connectionIssue
+    if (connectionPhase === 'auth') return `Step 1 of 2: establishing the anonymous Firebase session · ${connectionElapsed}s.`
+    if (connectionPhase === 'restarting') return 'Restarting the Firestore network connection.'
+    if (!serverReady) {
+      const cachedText = cacheSeen ? ' Last saved choices are shown provisionally.' : ''
+      return `Step 2 of 2: requesting authoritative Firestore data · ${connectionElapsed}s.${cachedText}`
+    }
+    if (pendingWrites > 0 || listenerHasPendingWrites) return 'Saving the latest change to Firebase.'
+    if (listenerFromCache) return 'The live connection was interrupted. Firestore is reconnecting.'
+    return `Firebase project ${firebaseProjectId} is connected and is the source of truth.`
+  }, [cacheSeen, connectionElapsed, connectionIssue, connectionPhase, error, isOnline, listenerFromCache, listenerHasPendingWrites, pendingWrites, serverReady])
+
+  function blockUntilAuthoritative() {
+    setConnectionIssue('Firebase has not confirmed the shared board yet. Use Retry now if this does not clear shortly.')
+  }
+
+  async function setDecision(eventId, choice) {
+    if (hasSharedBackend && !canEdit) {
+      blockUntilAuthoritative()
       return
     }
-    const existing = votes.find((vote) => vote.user_id === sharedMember.user_id && vote.event_id === eventId)
-    const nextChoice = existing?.choice === choice ? null : choice
+
+    const currentVotes = votesRef.current
+    const currentChoices = groupChoicesRef.current
+    const existingVote = currentVotes.find((vote) => vote.user_id === sharedMember.user_id && vote.event_id === eventId)
+    const currentlyAttending = currentChoices.some((item) => item.event_id === eventId)
+
+    let nextChoice
+    if (choice === 'going') {
+      nextChoice = currentlyAttending ? null : 'going'
+    } else {
+      nextChoice = existingVote?.choice === choice ? null : choice
+    }
+
+    const nextVotes = currentVotes.filter((vote) => !(vote.user_id === sharedMember.user_id && vote.event_id === eventId))
+    if (nextChoice) {
+      nextVotes.push({ trip_id: TRIP_ID, user_id: sharedMember.user_id, event_id: eventId, choice: nextChoice, updated_at: new Date().toISOString() })
+    }
+
+    const shouldAttend = nextChoice === 'going'
+    const groupRecord = {
+      trip_id: TRIP_ID,
+      decision_id: 'schedule',
+      event_id: eventId,
+      updated_by: backendUserId || sharedMember.user_id,
+      updated_at: new Date().toISOString(),
+    }
+    const nextChoices = shouldAttend
+      ? [...currentChoices.filter((item) => item.event_id !== eventId), groupRecord]
+      : currentChoices.filter((item) => item.event_id !== eventId)
+
+    votesRef.current = nextVotes
+    groupChoicesRef.current = nextChoices
+    setVotes(nextVotes)
+    setGroupChoices(nextChoices)
+    cacheSharedData({ votes: nextVotes, groupChoices: nextChoices })
 
     if (!hasSharedBackend) {
       const stored = loadLocalData()
-      stored.votes = (stored.votes || []).filter((vote) => !(vote.user_id === sharedMember.user_id && vote.event_id === eventId))
-      if (nextChoice) {
-        stored.votes.push({ trip_id: TRIP_ID, user_id: sharedMember.user_id, event_id: eventId, choice: nextChoice, updated_at: new Date().toISOString() })
-      }
+      stored.votes = nextVotes
+      stored.groupChoices = nextChoices
       saveLocalData(stored)
-      hydrateLocal()
       return
     }
 
-    const previousVotes = votes
-    setVotes((current) => {
-      const remaining = current.filter((vote) => !(vote.user_id === sharedMember.user_id && vote.event_id === eventId))
-      return nextChoice ? [...remaining, { trip_id: TRIP_ID, user_id: sharedMember.user_id, event_id: eventId, choice: nextChoice }] : remaining
-    })
-
-    setSyncState('saving')
+    setPendingWrites((count) => count + 1)
     const voteRef = doc(db, 'trips', TRIP_ID, 'votes', `${sharedMember.user_id}--${eventId}`)
+    const choiceRef = doc(db, 'trips', TRIP_ID, 'groupChoices', eventId)
+
     try {
+      const batch = writeBatch(db)
       if (nextChoice) {
-        await setDoc(voteRef, {
+        batch.set(voteRef, {
           trip_id: TRIP_ID,
           user_id: sharedMember.user_id,
           event_id: eventId,
@@ -231,23 +424,34 @@ function useTripData() {
           updated_at: serverTimestamp(),
         })
       } else {
-        await deleteDoc(voteRef)
+        batch.delete(voteRef)
       }
-      setSyncState('ready')
+      if (shouldAttend) {
+        batch.set(choiceRef, { ...groupRecord, updated_at: serverTimestamp() })
+      } else {
+        batch.delete(choiceRef)
+      }
+      await batch.commit()
     } catch (err) {
-      setVotes(previousVotes)
-      setError(err.message || 'Could not save the shared preference.')
-      setSyncState('error')
+      votesRef.current = currentVotes
+      groupChoicesRef.current = currentChoices
+      setVotes(currentVotes)
+      setGroupChoices(currentChoices)
+      cacheSharedData({ votes: currentVotes, groupChoices: currentChoices })
+      setError(err.message || 'Could not save the shared schedule decision.')
+    } finally {
+      setPendingWrites((count) => Math.max(0, count - 1))
     }
   }
 
   async function setGroupChoice(decisionId, eventId) {
-    if (hasSharedBackend && !backendUserId) {
-      setError('The shared board is still connecting. Try again in a moment.')
+    if (hasSharedBackend && !canEdit) {
+      blockUntilAuthoritative()
       return
     }
-    const clear = groupChoices.some((item) => item.event_id === eventId)
-    const previousChoices = groupChoices
+
+    const currentChoices = groupChoicesRef.current
+    const clear = currentChoices.some((item) => item.event_id === eventId)
     const record = {
       trip_id: TRIP_ID,
       decision_id: decisionId,
@@ -256,10 +460,12 @@ function useTripData() {
       updated_at: new Date().toISOString(),
     }
     const nextChoices = clear
-      ? groupChoices.filter((item) => item.event_id !== eventId)
-      : [...groupChoices.filter((item) => item.event_id !== eventId), record]
+      ? currentChoices.filter((item) => item.event_id !== eventId)
+      : [...currentChoices.filter((item) => item.event_id !== eventId), record]
 
+    groupChoicesRef.current = nextChoices
     setGroupChoices(nextChoices)
+    cacheSharedData({ groupChoices: nextChoices })
 
     if (!hasSharedBackend) {
       const stored = loadLocalData()
@@ -268,7 +474,7 @@ function useTripData() {
       return
     }
 
-    setSyncState('saving')
+    setPendingWrites((count) => count + 1)
     const choiceRef = doc(db, 'trips', TRIP_ID, 'groupChoices', eventId)
     try {
       if (clear) {
@@ -276,25 +482,30 @@ function useTripData() {
       } else {
         await setDoc(choiceRef, { ...record, updated_at: serverTimestamp() })
       }
-      setSyncState('ready')
     } catch (err) {
-      setGroupChoices(previousChoices)
+      groupChoicesRef.current = currentChoices
+      setGroupChoices(currentChoices)
+      cacheSharedData({ groupChoices: currentChoices })
       setError(err.message || 'Could not update the group selection.')
-      setSyncState('error')
+    } finally {
+      setPendingWrites((count) => Math.max(0, count - 1))
     }
   }
 
   async function clearGroupChoices(eventIds = []) {
-    if (hasSharedBackend && !backendUserId) {
-      setError('The shared board is still connecting. Try again in a moment.')
+    if (hasSharedBackend && !canEdit) {
+      blockUntilAuthoritative()
       return
     }
+
     const ids = [...new Set(eventIds)]
     if (!ids.length) return
 
-    const previousChoices = groupChoices
-    const nextChoices = groupChoices.filter((item) => !ids.includes(item.event_id))
+    const currentChoices = groupChoicesRef.current
+    const nextChoices = currentChoices.filter((item) => !ids.includes(item.event_id))
+    groupChoicesRef.current = nextChoices
     setGroupChoices(nextChoices)
+    cacheSharedData({ groupChoices: nextChoices })
 
     if (!hasSharedBackend) {
       const stored = loadLocalData()
@@ -303,14 +514,16 @@ function useTripData() {
       return
     }
 
-    setSyncState('saving')
+    setPendingWrites((count) => count + 1)
     try {
       await Promise.all(ids.map((eventId) => deleteDoc(doc(db, 'trips', TRIP_ID, 'groupChoices', eventId))))
-      setSyncState('ready')
     } catch (err) {
-      setGroupChoices(previousChoices)
+      groupChoicesRef.current = currentChoices
+      setGroupChoices(currentChoices)
+      cacheSharedData({ groupChoices: currentChoices })
       setError(err.message || 'Could not clear the group selections.')
-      setSyncState('error')
+    } finally {
+      setPendingWrites((count) => Math.max(0, count - 1))
     }
   }
 
@@ -319,22 +532,40 @@ function useTripData() {
     members: [],
     votes,
     groupChoices,
-    loading,
+    loading: false,
     syncState,
+    syncDetail,
+    connectionElapsed,
+    canEdit,
     error,
     setError,
-    setVote,
+    retryFirebase,
+    setVote: setDecision,
+    setDecision,
     setGroupChoice,
     clearGroupChoices,
   }
 }
-function SyncBadge({ state }) {
-  const isLive = state === 'ready'
-  const isLocal = state === 'local'
+function SyncBadge({ state, elapsed = 0, detail = '' }) {
+  const labels = {
+    ready: 'Live sync',
+    saving: 'Saving',
+    cached: 'Cached',
+    offline: 'Offline',
+    local: 'Device demo',
+    error: 'Sync error',
+    connecting: 'Connecting',
+    retrying: 'Still connecting',
+    reconnecting: 'Reconnecting',
+    restarting: 'Restarting',
+  }
+  const icon = ['ready', 'saving', 'connecting', 'retrying', 'reconnecting', 'restarting', 'cached'].includes(state) ? 'wifi' : 'offline'
+  const showElapsed = ['connecting', 'retrying'].includes(state) && elapsed > 0
+  const label = `${labels[state] || 'Connecting'}${showElapsed ? ` · ${elapsed}s` : ''}`
   return (
-    <span className={classNames('sync-badge', isLive && 'live', state === 'error' && 'error')}>
-      <Icon name={isLive ? 'wifi' : isLocal ? 'offline' : 'wifi'} size={15} />
-      {isLive ? 'Live sync' : isLocal ? 'Device demo' : state === 'error' ? 'Sync error' : 'Connecting'}
+    <span className={classNames('sync-badge', state)} title={detail || labels[state] || 'Connecting'} aria-label={detail || label}>
+      <Icon name={icon} size={15} />
+      <span>{label}</span>
     </span>
   )
 }
@@ -352,27 +583,33 @@ function DayToggle({ activeDay, onChange }) {
   )
 }
 
-function VoteControls({ eventId, member, votes, onVote, compact = false }) {
-  const myVote = votes.find((vote) => vote.user_id === member?.user_id && vote.event_id === eventId)?.choice
+function VoteControls({ eventId, member, votes, onVote, compact = false, disabled = false, attending = false, overrideAvailable = false }) {
+  const storedChoice = votes.find((vote) => vote.user_id === member?.user_id && vote.event_id === eventId)?.choice
+  const selectedChoice = attending ? 'going' : storedChoice
   return (
-    <div className={classNames('vote-controls', compact && 'compact')} aria-label="Your interest">
-      {Object.entries(choiceLabels).map(([choice, label]) => (
-        <button
-          key={choice}
-          className={classNames(`vote-${choice}`, myVote === choice && 'selected')}
-          onClick={() => onVote(eventId, choice)}
-          aria-pressed={myVote === choice}
-        >
-          {label}
-        </button>
-      ))}
+    <div className={classNames('vote-controls', compact && 'compact')} aria-label="Schedule decision">
+      {Object.entries(choiceLabels).map(([choice, label]) => {
+        const displayLabel = choice === 'going' && overrideAvailable && !attending ? 'Override & attend' : label
+        return (
+          <button
+            key={choice}
+            className={classNames(`vote-${choice}`, selectedChoice === choice && 'selected')}
+            onClick={() => onVote(eventId, choice)}
+            aria-pressed={selectedChoice === choice}
+            disabled={disabled}
+            title={disabled ? 'Editing unlocks after Firebase confirms the current shared board.' : undefined}
+          >
+            {displayLabel}
+          </button>
+        )
+      })}
     </div>
   )
 }
 
 function VoteSummary({ eventId, votes, members }) {
   const eventVotes = votes.filter((vote) => vote.event_id === eventId)
-  if (!eventVotes.length) return <span className="muted tiny">No votes yet</span>
+  if (!eventVotes.length) return <span className="muted tiny">No decision yet</span>
 
   const counts = eventVotes.reduce((acc, vote) => {
     acc[vote.choice] = (acc[vote.choice] || 0) + 1
@@ -385,7 +622,7 @@ function VoteSummary({ eventId, votes, members }) {
 
   return (
     <div className="vote-summary">
-      <span className="summary-pill strong">{counts.going || 0} want</span>
+      <span className="summary-pill strong">{counts.going || 0} attend</span>
       <span className="summary-pill">{counts.maybe || 0} maybe</span>
       <span className="summary-pill subdued">{counts.skip || 0} skip</span>
       {wanting.length > 0 && <span className="wanting-names">{wanting.join(', ')}</span>}
@@ -393,7 +630,7 @@ function VoteSummary({ eventId, votes, members }) {
   )
 }
 
-function EventOption({ event, decision, selectedEventIds, selectedGroupEvents, member, members, votes, onVote, onGroupChoice }) {
+function EventOption({ event, decision, selectedEventIds, selectedGroupEvents, member, members, votes, onVote, onGroupChoice, canEdit }) {
   const selected = selectedEventIds?.has(event.id)
   const startingNow = decision.time === event.start
   const conflictingSelections = selected
@@ -438,10 +675,12 @@ function EventOption({ event, decision, selectedEventIds, selectedGroupEvents, m
         <VoteSummary eventId={event.id} votes={votes} members={members} />
       </div>
       <div className="option-actions">
-        <VoteControls eventId={event.id} member={member} votes={votes} onVote={onVote} compact />
+        <VoteControls eventId={event.id} member={member} votes={votes} onVote={onVote} compact disabled={!canEdit} />
         <button
           className={classNames('group-pick-button', selected && 'selected', isConflictMuted && 'override')}
           onClick={() => onGroupChoice(decision.id, event.id)}
+          disabled={!canEdit}
+          title={!canEdit ? 'Editing unlocks after Firebase confirms the current shared board.' : undefined}
         >
           {selected ? 'Clear group pick' : isConflictMuted ? 'Add override' : 'Set group pick'}
         </button>
@@ -450,7 +689,7 @@ function EventOption({ event, decision, selectedEventIds, selectedGroupEvents, m
   )
 }
 
-function DecisionCard({ decision, selectedEventIds, selectedGroupEvents, member, members, votes, onVote, onGroupChoice, defaultOpen = false }) {
+function DecisionCard({ decision, selectedEventIds, selectedGroupEvents, member, members, votes, onVote, onGroupChoice, canEdit, defaultOpen = false }) {
   const selectedEvents = decision.active.filter((event) => selectedEventIds.has(event.id))
   const [open, setOpen] = useState(defaultOpen || selectedEvents.length > 0)
   const day = days.find((item) => item.id === decision.day)
@@ -515,6 +754,7 @@ function DecisionCard({ decision, selectedEventIds, selectedGroupEvents, member,
                 votes={votes}
                 onVote={onVote}
                 onGroupChoice={onGroupChoice}
+                canEdit={canEdit}
               />
             ))}
         </div>
@@ -523,7 +763,7 @@ function DecisionCard({ decision, selectedEventIds, selectedGroupEvents, member,
   )
 }
 
-function DecisionsView({ activeDay, member, members, votes, groupChoices, onVote, onGroupChoice }) {
+function DecisionsView({ activeDay, member, members, votes, groupChoices, onVote, onGroupChoice, canEdit }) {
   const points = decisionPoints.filter((point) => point.day === activeDay)
   const selectedEventIds = useMemo(() => new Set(groupChoices.map((choice) => choice.event_id)), [groupChoices])
   const selectedGroupEvents = useMemo(
@@ -554,6 +794,7 @@ function DecisionsView({ activeDay, member, members, votes, groupChoices, onVote
             votes={votes}
             onVote={onVote}
             onGroupChoice={onGroupChoice}
+            canEdit={canEdit}
             defaultOpen={index === 0}
           />
         ))}
@@ -579,11 +820,19 @@ function overlaps(first, second) {
   return minutes(first.start) < minutes(second.end) && minutes(second.start) < minutes(first.end)
 }
 
+function isNonBlockingWindow(event) {
+  return Boolean(event.flexible || event.category === 'Air Show')
+}
+
+function staysVisibleDuringConflicts(event) {
+  return Boolean(event.flexible || event.category === 'Demonstration' || event.category === 'Air Show')
+}
+
 function selectedConflictIdsFor(selectedEvents) {
   const ids = new Set()
   selectedEvents.forEach((event, index) => {
     selectedEvents.slice(index + 1).forEach((other) => {
-      if (event.day === other.day && overlaps(event, other)) {
+      if (event.day === other.day && !isNonBlockingWindow(event) && !isNonBlockingWindow(other) && overlaps(event, other)) {
         ids.add(event.id)
         ids.add(other.id)
       }
@@ -592,10 +841,21 @@ function selectedConflictIdsFor(selectedEvents) {
   return ids
 }
 
+function conflictCandidatesFor(dayEvents, selectedEvents) {
+  const blockingSelections = selectedEvents.filter((event) => !isNonBlockingWindow(event))
+  const selectedIds = new Set(selectedEvents.map((event) => event.id))
+  const conflicts = new Set()
+  dayEvents.forEach((event) => {
+    if (event.pending || selectedIds.has(event.id) || isNonBlockingWindow(event)) return
+    if (blockingSelections.some((selected) => selected.id !== event.id && overlaps(event, selected))) conflicts.add(event.id)
+  })
+  return conflicts
+}
+
 function buildTimelineLayout(dayEvents) {
   const timed = dayEvents.filter((event) => !event.pending)
-  const flexible = timed.filter((event) => event.flexible)
-  const fixed = timed.filter((event) => !event.flexible)
+  const featured = timed.filter((event) => isNonBlockingWindow(event))
+  const fixed = timed.filter((event) => !isNonBlockingWindow(event))
   const earliest = Math.floor(Math.min(...timed.map((event) => minutes(event.start))) / 60) * 60
   const latest = Math.ceil(Math.max(...timed.map((event) => minutes(event.end))) / 60) * 60
 
@@ -612,9 +872,9 @@ function buildTimelineLayout(dayEvents) {
       })
   }
 
-  const flexibleLayout = assignLanes(flexible)
-  const fixedLayout = assignLanes(fixed, flexibleLayout.length ? Math.max(...flexibleLayout.map((item) => item.lane)) + 1 : 0)
-  const layout = [...flexibleLayout, ...fixedLayout]
+  const featuredLayout = assignLanes(featured)
+  const fixedLayout = assignLanes(fixed, featuredLayout.length ? Math.max(...featuredLayout.map((item) => item.lane)) + 1 : 0)
+  const layout = [...featuredLayout, ...fixedLayout]
   const lanes = layout.length ? Math.max(...layout.map((item) => item.lane)) + 1 : 1
   const conflictedIds = new Set()
 
@@ -636,7 +896,7 @@ function buildTimelineLayout(dayEvents) {
   return { timed, layout, lanes, earliest, latest, conflictedIds, segments }
 }
 
-function Timeline({ dayEvents, activeDay, member, votes, groupChoices, onVote, onClearGroupChoices }) {
+function Timeline({ dayEvents, activeDay, member, votes, groupChoices, onDecision, onClearGroupChoices, canEdit }) {
   const [focusedId, setFocusedId] = useState(null)
   const groupPickedIds = useMemo(() => new Set(groupChoices.map((choice) => choice.event_id)), [groupChoices])
   const selectedGroupEvents = useMemo(
@@ -644,16 +904,15 @@ function Timeline({ dayEvents, activeDay, member, votes, groupChoices, onVote, o
     [dayEvents, groupPickedIds],
   )
   const selectedOverrideIds = useMemo(() => selectedConflictIdsFor(selectedGroupEvents), [selectedGroupEvents])
+  const conflictCandidateIds = useMemo(() => conflictCandidatesFor(dayEvents, selectedGroupEvents), [dayEvents, selectedGroupEvents])
   const hiddenConflictIds = useMemo(() => {
     const hidden = new Set()
-    if (!selectedGroupEvents.length) return hidden
-
-    dayEvents.forEach((event) => {
-      if (event.pending || groupPickedIds.has(event.id) || event.category === 'Demonstration') return
-      if (selectedGroupEvents.some((selected) => overlaps(event, selected))) hidden.add(event.id)
+    conflictCandidateIds.forEach((eventId) => {
+      const event = dayEvents.find((item) => item.id === eventId)
+      if (event && !staysVisibleDuringConflicts(event)) hidden.add(eventId)
     })
     return hidden
-  }, [dayEvents, groupPickedIds, selectedGroupEvents])
+  }, [conflictCandidateIds, dayEvents])
   const visibleDayEvents = useMemo(
     () => dayEvents.filter((event) => !hiddenConflictIds.has(event.id)),
     [dayEvents, hiddenConflictIds],
@@ -678,9 +937,7 @@ function Timeline({ dayEvents, activeDay, member, votes, groupChoices, onVote, o
     <section className="timeline-card" aria-label={`${activeDay === 'sat' ? 'Saturday' : 'Sunday'} visual timeline`}>
       <div className="timeline-heading">
         <div>
-          <span className="kicker">Visual day plan</span>
           <h2>Timeline and conflict map</h2>
-          <p>Scroll sideways. Group picks automatically remove conflicting events, while demonstrations stay visible.</p>
         </div>
         <div className="timeline-conflict-key" aria-label="Conflict intensity legend">
           <span><i className="load-low" /> clear</span>
@@ -694,12 +951,14 @@ function Timeline({ dayEvents, activeDay, member, votes, groupChoices, onVote, o
           <Icon name="check" size={16} />
           <span>
             <strong>{hiddenConflictIds.size} conflicting {hiddenConflictIds.size === 1 ? 'event' : 'events'} hidden</strong>
-            Group picks are temporary. Clear them to restore the complete timeline. Demonstrations remain visible even when they overlap.
+            Attend choices are reversible. Clear them to restore the complete timeline. Demonstrations, flexible displays, and air shows remain visible.
           </span>
           <button
             type="button"
             className="timeline-restore-button"
             onClick={() => onClearGroupChoices(selectedGroupEvents.map((event) => event.id))}
+            disabled={!canEdit}
+            title={!canEdit ? 'Editing unlocks after Firebase confirms the current shared board.' : undefined}
           >
             Restore all
           </button>
@@ -746,6 +1005,7 @@ function Timeline({ dayEvents, activeDay, member, votes, groupChoices, onVote, o
                     'timeline-event',
                     conflict && 'has-conflict',
                     event.flexible && 'is-flexible',
+                    event.category === 'Air Show' && 'is-featured-airshow',
                     isGroupPick && 'is-group-pick',
                     isOverride && 'is-override',
                     ownVote && `is-${ownVote}`,
@@ -789,19 +1049,29 @@ function Timeline({ dayEvents, activeDay, member, votes, groupChoices, onVote, o
               <em><Icon name="alert" size={14} /> Conflicts with another fixed event</em>
             ) : null}
           </div>
-          <VoteControls eventId={focused.id} member={member} votes={votes} onVote={onVote} compact />
+          <VoteControls
+            eventId={focused.id}
+            member={member}
+            votes={votes}
+            onVote={onDecision}
+            compact
+            disabled={!canEdit}
+            attending={groupPickedIds.has(focused.id)}
+            overrideAvailable={conflictCandidateIds.has(focused.id)}
+          />
         </div>
       ) : (
-        <div className="timeline-tap-hint">Tap any colored event bar for details and voting.</div>
+        <div className="timeline-tap-hint">Tap any colored event bar to choose Attend, Maybe, or Skip.</div>
       )}
     </section>
   )
 }
 
-function EventCard({ event, member, members, votes, onVote, groupPickedIds, selectedOverrideIds }) {
+function EventCard({ event, member, members, votes, onDecision, groupPickedIds, selectedOverrideIds, conflictCandidateIds, canEdit }) {
   const conflicts = decisionForEvent(event.id)
   const isGroupPick = groupPickedIds.has(event.id)
   const isOverride = selectedOverrideIds.has(event.id)
+  const isConflictMuted = conflictCandidateIds.has(event.id) && !isGroupPick && !staysVisibleDuringConflicts(event)
   return (
     <article id={`event-${event.id}`} className={classNames(
       'schedule-event',
@@ -810,6 +1080,7 @@ function EventCard({ event, member, members, votes, onVote, groupPickedIds, sele
       event.pending && 'pending-event',
       isGroupPick && 'group-picked-event',
       isOverride && 'override-picked-event',
+      isConflictMuted && 'conflict-muted-event',
     )}>
       <div className="schedule-time">
         <strong>{event.pending ? 'TBD' : formatTime(event.start)}</strong>
@@ -820,21 +1091,31 @@ function EventCard({ event, member, members, votes, onVote, groupPickedIds, sele
           <span className="category-label"><i style={{ background: categoryPalette[event.category] || '#64748b' }} />{event.category}</span>
           {event.anchor && <span className="anchor-tag">Anchor</span>}
           {event.flexible && <span className="flex-tag">Flexible window</span>}
-          {conflicts.length > 0 && !event.flexible && <span className="conflict-tag">Decision point</span>}
+          {conflicts.length > 0 && !isNonBlockingWindow(event) && <span className="conflict-tag">Decision point</span>}
           {isGroupPick && <span className="schedule-pick-tag"><Icon name="check" size={11} /> Group pick</span>}
           {isOverride && <span className="schedule-override-tag"><Icon name="alert" size={11} /> Override</span>}
+          {isConflictMuted && <span className="schedule-conflict-muted-tag"><Icon name="alert" size={11} /> Conflicts with Attend choice</span>}
         </div>
         <h3>{event.title}</h3>
         <p><Icon name="map" size={15} /> {event.location}</p>
         {event.pending && <p className="pending-note">The screenshot did not include a complete time. Add it when confirmed.</p>}
         {!event.pending && <VoteSummary eventId={event.id} votes={votes} members={members} />}
-        {!event.pending && <VoteControls eventId={event.id} member={member} votes={votes} onVote={onVote} compact />}
+        {!event.pending && <VoteControls
+          eventId={event.id}
+          member={member}
+          votes={votes}
+          onVote={onDecision}
+          compact
+          disabled={!canEdit}
+          attending={isGroupPick}
+          overrideAvailable={conflictCandidateIds.has(event.id)}
+        />}
       </div>
     </article>
   )
 }
 
-function ScheduleView({ activeDay, member, members, votes, groupChoices, onVote, onClearGroupChoices }) {
+function ScheduleView({ activeDay, member, members, votes, groupChoices, onDecision, onClearGroupChoices, canEdit }) {
   const dayEvents = eventsForDay(activeDay)
   const groupPickedIds = useMemo(() => new Set(groupChoices.map((choice) => choice.event_id)), [groupChoices])
   const selectedGroupEvents = useMemo(
@@ -842,6 +1123,7 @@ function ScheduleView({ activeDay, member, members, votes, groupChoices, onVote,
     [dayEvents, groupPickedIds],
   )
   const selectedOverrideIds = useMemo(() => selectedConflictIdsFor(selectedGroupEvents), [selectedGroupEvents])
+  const conflictCandidateIds = useMemo(() => conflictCandidatesFor(dayEvents, selectedGroupEvents), [dayEvents, selectedGroupEvents])
 
   return (
     <main className="page-content">
@@ -851,8 +1133,9 @@ function ScheduleView({ activeDay, member, members, votes, groupChoices, onVote,
         member={member}
         votes={votes}
         groupChoices={groupChoices}
-        onVote={onVote}
+        onDecision={onDecision}
         onClearGroupChoices={onClearGroupChoices}
+        canEdit={canEdit}
       />
 
       <div className="section-heading schedule-list-heading">
@@ -863,6 +1146,7 @@ function ScheduleView({ activeDay, member, members, votes, groupChoices, onVote,
         <span className="count-chip">{dayEvents.length} events</span>
       </div>
 
+
       <div className="schedule-list">
         {dayEvents.map((event) => (
           <EventCard
@@ -871,9 +1155,11 @@ function ScheduleView({ activeDay, member, members, votes, groupChoices, onVote,
             member={member}
             members={members}
             votes={votes}
-            onVote={onVote}
+            onDecision={onDecision}
             groupPickedIds={groupPickedIds}
             selectedOverrideIds={selectedOverrideIds}
+            conflictCandidateIds={conflictCandidateIds}
+            canEdit={canEdit}
           />
         ))}
       </div>
@@ -881,10 +1167,46 @@ function ScheduleView({ activeDay, member, members, votes, groupChoices, onVote,
   )
 }
 
+
+function MapView() {
+  const [zoom, setZoom] = useState(() => window.innerWidth <= 720 ? 1.5 : 1)
+
+  function changeZoom(nextZoom) {
+    setZoom(Math.min(2.5, Math.max(1, nextZoom)))
+  }
+
+  return (
+    <main className="page-content map-page">
+      <section className="map-card" aria-label="AirVenture visitor map">
+        <div className="map-header">
+          <div>
+            <span className="kicker">Official visitor map</span>
+            <h2>AirVenture grounds map</h2>
+          </div>
+          <div className="map-zoom-controls" aria-label="Map zoom controls">
+            <button type="button" onClick={() => changeZoom(zoom - 0.5)} disabled={zoom <= 1} aria-label="Zoom out">−</button>
+            <button type="button" className="map-zoom-value" onClick={() => setZoom(1)} aria-label="Reset map zoom">{Math.round(zoom * 100)}%</button>
+            <button type="button" onClick={() => changeZoom(zoom + 0.5)} disabled={zoom >= 2.5} aria-label="Zoom in">+</button>
+          </div>
+        </div>
+        <div className="map-viewport">
+          <img
+            className="map-image"
+            src="/airventure-visitors-map-2026.webp"
+            alt="Official EAA AirVenture Oshkosh 2026 visitor map showing the grounds, venues, parking, transportation, food, services, and map grid."
+            style={{ width: `${zoom * 100}%` }}
+            draggable="false"
+          />
+        </div>
+      </section>
+    </main>
+  )
+}
+
 function App() {
   const trip = useTripData()
-  const [activeTab, setActiveTab] = useState('decisions')
   const [activeDay, setActiveDay] = useState('sat')
+  const [activeTab, setActiveTab] = useState('schedule')
   const [toast, setToast] = useState('')
 
   const upcomingDay = useMemo(() => {
@@ -941,7 +1263,7 @@ function App() {
           </div>
         </div>
         <div className="header-actions">
-          <SyncBadge state={trip.syncState} />
+          <SyncBadge state={trip.syncState} elapsed={trip.connectionElapsed} detail={trip.syncDetail} />
           <button className="icon-button" onClick={shareTrip} aria-label="Share trip"><Icon name="share" /></button>
         </div>
       </header>
@@ -950,38 +1272,61 @@ function App() {
         <div className="error-banner">
           <Icon name="alert" size={18} />
           <span>{trip.error}</span>
+          {hasSharedBackend && <button onClick={trip.retryFirebase}>Retry Firebase</button>}
           <button onClick={() => trip.setError('')}>Dismiss</button>
         </div>
       )}
 
-      {(activeTab === 'decisions' || activeTab === 'schedule') && (
+      {hasSharedBackend && !trip.canEdit && !trip.error && (
+        <div className={classNames('sync-notice', trip.syncState === 'retrying' && 'retrying')}>
+          <Icon name={trip.syncState === 'offline' ? 'offline' : 'wifi'} size={17} />
+          <span>
+            <strong>{trip.syncState === 'retrying' ? 'Firebase has not responded yet.' : 'Connecting to Firebase.'}</strong>{' '}
+            {trip.syncDetail} Editing unlocks automatically after Firebase confirms the server state.
+          </span>
+          <button className="sync-retry-button" type="button" onClick={trip.retryFirebase}>Retry now</button>
+        </div>
+      )}
+
+      {activeTab === 'schedule' && (
         <div className="sticky-day-bar"><DayToggle activeDay={activeDay} onChange={setActiveDay} /></div>
       )}
 
-      {activeTab === 'decisions' && (
-        <DecisionsView
+      {activeTab === 'schedule' ? (
+        <ScheduleView
           activeDay={activeDay}
           member={trip.member}
           members={trip.members}
           votes={trip.votes}
           groupChoices={trip.groupChoices}
-          onVote={trip.setVote}
-          onGroupChoice={trip.setGroupChoice}
+          onDecision={trip.setDecision}
+          onClearGroupChoices={trip.clearGroupChoices}
+          canEdit={trip.canEdit}
         />
-      )}
-      {activeTab === 'schedule' && (
-        <ScheduleView activeDay={activeDay} member={trip.member} members={trip.members} votes={trip.votes} groupChoices={trip.groupChoices} onVote={trip.setVote} onClearGroupChoices={trip.clearGroupChoices} />
+      ) : (
+        <MapView />
       )}
 
-      <nav className="bottom-nav" aria-label="Main navigation">
-        <button className={activeTab === 'decisions' ? 'active' : ''} onClick={() => setActiveTab('decisions')}>
-          <Icon name="decision" /><span>Decisions</span>
+      <nav className="bottom-nav" aria-label="Trip board sections">
+        <button
+          type="button"
+          className={activeTab === 'schedule' ? 'active' : ''}
+          onClick={() => setActiveTab('schedule')}
+          aria-current={activeTab === 'schedule' ? 'page' : undefined}
+        >
+          <Icon name="calendar" />
+          <span>Schedule</span>
         </button>
-        <button className={activeTab === 'schedule' ? 'active' : ''} onClick={() => setActiveTab('schedule')}>
-          <Icon name="calendar" /><span>Schedule</span>
+        <button
+          type="button"
+          className={activeTab === 'map' ? 'active' : ''}
+          onClick={() => setActiveTab('map')}
+          aria-current={activeTab === 'map' ? 'page' : undefined}
+        >
+          <Icon name="map" />
+          <span>Map</span>
         </button>
       </nav>
-
 
       {toast && <div className="toast" onAnimationEnd={() => setToast('')}>{toast}</div>}
     </div>
