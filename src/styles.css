@@ -839,3 +839,6 @@ button, input { color-scheme: dark; }
 @media (max-width: 720px) {
   .section-heading { margin-top: 10px; }
 }
+
+/* v1.7 — one shared board, no profiles or join screen */
+.bottom-nav { grid-template-columns: repeat(2, 1fr); }

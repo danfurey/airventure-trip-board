@@ -5,21 +5,14 @@ service cloud.firestore {
       return request.auth != null;
     }
 
-    match /trips/{tripId}/members/{userId} {
-      allow read: if signedIn();
-      allow create, update: if signedIn()
-        && request.auth.uid == userId
-        && request.resource.data.user_id == userId
-        && request.resource.data.trip_id == tripId;
-      allow delete: if signedIn() && request.auth.uid == userId;
-    }
-
+    // Every visitor has the same board permissions. Anonymous Authentication is
+    // used silently only to prevent unauthenticated internet writes.
     match /trips/{tripId}/votes/{voteId} {
       allow read: if signedIn();
       allow create, update: if signedIn()
-        && request.resource.data.user_id == request.auth.uid
-        && request.resource.data.trip_id == tripId;
-      allow delete: if signedIn() && resource.data.user_id == request.auth.uid;
+        && request.resource.data.trip_id == tripId
+        && request.resource.data.user_id == 'shared-board';
+      allow delete: if signedIn();
     }
 
     match /trips/{tripId}/groupChoices/{eventId} {

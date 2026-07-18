@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { browserLocalPersistence, onAuthStateChanged, setPersistence, signInAnonymously } from 'firebase/auth'
-import { collection, deleteDoc, doc, getDoc, onSnapshot, serverTimestamp, setDoc } from 'firebase/firestore'
+import { collection, deleteDoc, doc, onSnapshot, serverTimestamp, setDoc } from 'firebase/firestore'
 import {
   days,
   decisionForEvent,
@@ -16,16 +16,11 @@ import { auth, db, hasSharedBackend } from './lib/firebase'
 const TRIP_ID = import.meta.env.VITE_TRIP_ID || '9f1153d5-e0cd-4a8f-8f28-f78da5a6d6e5'
 const TRIP_NAME = import.meta.env.VITE_TRIP_NAME || 'AirVenture Weekend 2026'
 const LOCAL_KEY = `airventure-trip-board:${TRIP_ID}`
-const LOCAL_MEMBER_KEY = `airventure-trip-member:${TRIP_ID}`
 
 const choiceLabels = {
   going: 'Want it',
   maybe: 'Maybe',
   skip: 'Skip',
-}
-
-function newId() {
-  return globalThis.crypto?.randomUUID?.() || `local-${Date.now()}-${Math.random().toString(16).slice(2)}`
 }
 
 function loadLocalData() {
@@ -39,6 +34,11 @@ function loadLocalData() {
 function saveLocalData(data) {
   localStorage.setItem(LOCAL_KEY, JSON.stringify(data))
   window.dispatchEvent(new CustomEvent('airventure-local-change'))
+}
+
+function cacheSharedData(partial) {
+  const current = loadLocalData()
+  localStorage.setItem(LOCAL_KEY, JSON.stringify({ ...current, ...partial }))
 }
 
 function classNames(...values) {
@@ -76,22 +76,18 @@ function normalizeFirebaseRecord(snapshot) {
 }
 
 function useTripData() {
-  const [member, setMember] = useState(null)
-  const [members, setMembers] = useState([])
-  const [votes, setVotes] = useState([])
-  const [groupChoices, setGroupChoices] = useState([])
-  const [loading, setLoading] = useState(true)
+  const sharedMember = useMemo(() => ({ trip_id: TRIP_ID, user_id: 'shared-board', display_name: 'Shared board' }), [])
+  const [votes, setVotes] = useState(() => loadLocalData().votes || [])
+  const [groupChoices, setGroupChoices] = useState(() => loadLocalData().groupChoices || [])
+  const [loading, setLoading] = useState(false)
   const [syncState, setSyncState] = useState(hasSharedBackend ? 'connecting' : 'local')
   const [error, setError] = useState('')
   const [backendUserId, setBackendUserId] = useState(null)
 
   const hydrateLocal = useCallback(() => {
     const stored = loadLocalData()
-    const memberId = localStorage.getItem(LOCAL_MEMBER_KEY)
-    setMembers(stored.members || [])
     setVotes(stored.votes || [])
     setGroupChoices(stored.groupChoices || [])
-    setMember((stored.members || []).find((item) => item.user_id === memberId) || null)
     setLoading(false)
     setSyncState('local')
   }, [])
@@ -127,7 +123,7 @@ function useTripData() {
           } catch (err) {
             console.error(err)
             if (!cancelled) {
-              setError(err.message || 'Could not create a Firebase session.')
+              setError(err.message || 'Could not connect to the shared board.')
               setLoading(false)
               setSyncState('error')
             }
@@ -136,7 +132,7 @@ function useTripData() {
       } catch (err) {
         console.error(err)
         if (!cancelled) {
-          setError(err.message || 'Could not initialize Firebase Authentication.')
+          setError(err.message || 'Could not initialize the shared board.')
           setLoading(false)
           setSyncState('error')
         }
@@ -153,67 +149,28 @@ function useTripData() {
   useEffect(() => {
     if (!hasSharedBackend || !backendUserId) return undefined
 
-    const memberRef = doc(db, 'trips', TRIP_ID, 'members', backendUserId)
-    return onSnapshot(
-      memberRef,
-      (snapshot) => {
-        if (snapshot.exists()) {
-          setMember(normalizeFirebaseRecord(snapshot))
-        } else {
-          setMember(null)
-          setMembers([])
-          setVotes([])
-          setGroupChoices([])
-          setLoading(false)
-          setSyncState('ready')
-        }
-      },
-      (err) => {
-        console.error(err)
-        setError(err.message || 'Could not read your Firebase trip profile.')
-        setLoading(false)
-        setSyncState('error')
-      },
-    )
-  }, [backendUserId])
-
-  const joinedUserId = member?.user_id === backendUserId ? backendUserId : null
-
-  useEffect(() => {
-    if (!hasSharedBackend || !joinedUserId) return undefined
-
     setSyncState('connecting')
-    const loaded = { members: false, votes: false, choices: false }
+    const loaded = { votes: false, choices: false }
     const markLoaded = (name) => {
       loaded[name] = true
-      if (loaded.members && loaded.votes && loaded.choices) {
+      if (loaded.votes && loaded.choices) {
         setLoading(false)
         setSyncState('ready')
       }
     }
     const handleError = (err) => {
       console.error(err)
-      setError(err.message || 'Could not synchronize the Firebase trip board.')
+      setError(err.message || 'Could not synchronize the shared trip board.')
       setLoading(false)
       setSyncState('error')
     }
 
-    const unsubscribeMembers = onSnapshot(
-      collection(db, 'trips', TRIP_ID, 'members'),
-      (snapshot) => {
-        const records = snapshot.docs
-          .map(normalizeFirebaseRecord)
-          .sort((a, b) => String(a.created_at || '').localeCompare(String(b.created_at || '')))
-        setMembers(records)
-        markLoaded('members')
-      },
-      handleError,
-    )
-
     const unsubscribeVotes = onSnapshot(
       collection(db, 'trips', TRIP_ID, 'votes'),
       (snapshot) => {
-        setVotes(snapshot.docs.map(normalizeFirebaseRecord))
+        const nextVotes = snapshot.docs.map(normalizeFirebaseRecord)
+        setVotes(nextVotes)
+        cacheSharedData({ votes: nextVotes })
         markLoaded('votes')
       },
       handleError,
@@ -222,62 +179,33 @@ function useTripData() {
     const unsubscribeChoices = onSnapshot(
       collection(db, 'trips', TRIP_ID, 'groupChoices'),
       (snapshot) => {
-        setGroupChoices(snapshot.docs.map(normalizeFirebaseRecord))
+        const nextChoices = snapshot.docs.map(normalizeFirebaseRecord)
+        setGroupChoices(nextChoices)
+        cacheSharedData({ groupChoices: nextChoices })
         markLoaded('choices')
       },
       handleError,
     )
 
     return () => {
-      unsubscribeMembers()
       unsubscribeVotes()
       unsubscribeChoices()
     }
-  }, [joinedUserId])
-
-  async function saveName(displayName) {
-    const cleanName = displayName.trim().slice(0, 40)
-    if (!cleanName) return
-
-    if (!hasSharedBackend) {
-      let memberId = localStorage.getItem(LOCAL_MEMBER_KEY)
-      if (!memberId) {
-        memberId = newId()
-        localStorage.setItem(LOCAL_MEMBER_KEY, memberId)
-      }
-      const stored = loadLocalData()
-      const record = { trip_id: TRIP_ID, user_id: memberId, display_name: cleanName, created_at: new Date().toISOString() }
-      stored.members = [...(stored.members || []).filter((item) => item.user_id !== memberId), record]
-      saveLocalData(stored)
-      hydrateLocal()
-      return
-    }
-
-    if (!backendUserId) throw new Error('Firebase is still connecting. Try again in a moment.')
-    setSyncState('saving')
-    const memberRef = doc(db, 'trips', TRIP_ID, 'members', backendUserId)
-    const existing = await getDoc(memberRef)
-    const record = {
-      trip_id: TRIP_ID,
-      user_id: backendUserId,
-      display_name: cleanName,
-      updated_at: serverTimestamp(),
-    }
-    if (!existing.exists()) record.created_at = serverTimestamp()
-    await setDoc(memberRef, record, { merge: true })
-    setSyncState('connecting')
-  }
+  }, [backendUserId])
 
   async function setVote(eventId, choice) {
-    if (!member) return
-    const existing = votes.find((vote) => vote.user_id === member.user_id && vote.event_id === eventId)
+    if (hasSharedBackend && !backendUserId) {
+      setError('The shared board is still connecting. Try again in a moment.')
+      return
+    }
+    const existing = votes.find((vote) => vote.user_id === sharedMember.user_id && vote.event_id === eventId)
     const nextChoice = existing?.choice === choice ? null : choice
 
     if (!hasSharedBackend) {
       const stored = loadLocalData()
-      stored.votes = (stored.votes || []).filter((vote) => !(vote.user_id === member.user_id && vote.event_id === eventId))
+      stored.votes = (stored.votes || []).filter((vote) => !(vote.user_id === sharedMember.user_id && vote.event_id === eventId))
       if (nextChoice) {
-        stored.votes.push({ trip_id: TRIP_ID, user_id: member.user_id, event_id: eventId, choice: nextChoice, updated_at: new Date().toISOString() })
+        stored.votes.push({ trip_id: TRIP_ID, user_id: sharedMember.user_id, event_id: eventId, choice: nextChoice, updated_at: new Date().toISOString() })
       }
       saveLocalData(stored)
       hydrateLocal()
@@ -286,19 +214,20 @@ function useTripData() {
 
     const previousVotes = votes
     setVotes((current) => {
-      const remaining = current.filter((vote) => !(vote.user_id === member.user_id && vote.event_id === eventId))
-      return nextChoice ? [...remaining, { trip_id: TRIP_ID, user_id: member.user_id, event_id: eventId, choice: nextChoice }] : remaining
+      const remaining = current.filter((vote) => !(vote.user_id === sharedMember.user_id && vote.event_id === eventId))
+      return nextChoice ? [...remaining, { trip_id: TRIP_ID, user_id: sharedMember.user_id, event_id: eventId, choice: nextChoice }] : remaining
     })
 
     setSyncState('saving')
-    const voteRef = doc(db, 'trips', TRIP_ID, 'votes', `${member.user_id}--${eventId}`)
+    const voteRef = doc(db, 'trips', TRIP_ID, 'votes', `${sharedMember.user_id}--${eventId}`)
     try {
       if (nextChoice) {
         await setDoc(voteRef, {
           trip_id: TRIP_ID,
-          user_id: member.user_id,
+          user_id: sharedMember.user_id,
           event_id: eventId,
           choice: nextChoice,
+          updated_by: backendUserId,
           updated_at: serverTimestamp(),
         })
       } else {
@@ -307,21 +236,23 @@ function useTripData() {
       setSyncState('ready')
     } catch (err) {
       setVotes(previousVotes)
-      setError(err.message || 'Could not save your vote.')
+      setError(err.message || 'Could not save the shared preference.')
       setSyncState('error')
     }
   }
 
   async function setGroupChoice(decisionId, eventId) {
-    if (!member) return
-
+    if (hasSharedBackend && !backendUserId) {
+      setError('The shared board is still connecting. Try again in a moment.')
+      return
+    }
     const clear = groupChoices.some((item) => item.event_id === eventId)
     const previousChoices = groupChoices
     const record = {
       trip_id: TRIP_ID,
       decision_id: decisionId,
       event_id: eventId,
-      updated_by: member.user_id,
+      updated_by: backendUserId || sharedMember.user_id,
       updated_at: new Date().toISOString(),
     }
     const nextChoices = clear
@@ -354,7 +285,10 @@ function useTripData() {
   }
 
   async function clearGroupChoices(eventIds = []) {
-    if (!member) return
+    if (hasSharedBackend && !backendUserId) {
+      setError('The shared board is still connecting. Try again in a moment.')
+      return
+    }
     const ids = [...new Set(eventIds)]
     if (!ids.length) return
 
@@ -381,21 +315,19 @@ function useTripData() {
   }
 
   return {
-    member,
-    members,
+    member: sharedMember,
+    members: [],
     votes,
     groupChoices,
     loading,
     syncState,
     error,
     setError,
-    saveName,
     setVote,
     setGroupChoice,
     clearGroupChoices,
   }
 }
-
 function SyncBadge({ state }) {
   const isLive = state === 'ready'
   const isLocal = state === 'local'
@@ -949,133 +881,10 @@ function ScheduleView({ activeDay, member, members, votes, groupChoices, onVote,
   )
 }
 
-function GroupView({ member, members, votes, groupChoices, onEditName }) {
-  const memberStats = members.map((person) => {
-    const personVotes = votes.filter((vote) => vote.user_id === person.user_id)
-    return {
-      ...person,
-      wants: personVotes.filter((vote) => vote.choice === 'going').length,
-      maybes: personVotes.filter((vote) => vote.choice === 'maybe').length,
-    }
-  })
-
-  const popular = events
-    .filter((event) => !event.pending)
-    .map((event) => ({
-      event,
-      wants: votes.filter((vote) => vote.event_id === event.id && vote.choice === 'going').length,
-      maybes: votes.filter((vote) => vote.event_id === event.id && vote.choice === 'maybe').length,
-    }))
-    .filter((item) => item.wants || item.maybes)
-    .sort((a, b) => b.wants - a.wants || b.maybes - a.maybes)
-    .slice(0, 6)
-
-  return (
-    <main className="page-content">
-      <section className="group-hero">
-        <div>
-          <span className="kicker">Travel group</span>
-          <h1>{members.length} {members.length === 1 ? 'person' : 'people'} on the board.</h1>
-          <p>Each phone keeps its own identity. Votes and group picks synchronize in shared mode.</p>
-        </div>
-        <button className="secondary-button" onClick={onEditName}><Icon name="edit" size={16} /> Edit my name</button>
-      </section>
-
-      <section className="panel">
-        <div className="panel-heading">
-          <h2>People</h2>
-          <span className="count-chip">{groupChoices.length} group picks</span>
-        </div>
-        <div className="member-list">
-          {memberStats.map((person) => (
-            <div className="member-row" key={person.user_id}>
-              <div className="avatar">{person.display_name.slice(0, 1).toUpperCase()}</div>
-              <div className="member-name">
-                <strong>{person.display_name}</strong>
-                {person.user_id === member?.user_id && <span>You</span>}
-              </div>
-              <div className="member-counts">
-                <span><strong>{person.wants}</strong> want</span>
-                <span><strong>{person.maybes}</strong> maybe</span>
-              </div>
-            </div>
-          ))}
-        </div>
-      </section>
-
-      <section className="panel">
-        <div className="panel-heading"><h2>Most wanted</h2></div>
-        {popular.length ? (
-          <div className="popular-list">
-            {popular.map(({ event, wants, maybes }) => (
-              <div className="popular-row" key={event.id}>
-                <div>
-                  <strong>{event.title}</strong>
-                  <span>{days.find((day) => day.id === event.day)?.shortLabel} · {formatTime(event.start)}</span>
-                </div>
-                <div className="popular-score"><strong>{wants}</strong><span>want</span><small>{maybes} maybe</small></div>
-              </div>
-            ))}
-          </div>
-        ) : (
-          <p className="empty-state">No one has voted yet.</p>
-        )}
-      </section>
-
-      <section className="privacy-note">
-        <Icon name="wifi" />
-        <div>
-          <strong>{hasSharedBackend ? 'Shared realtime mode' : 'Local demo mode'}</strong>
-          <p>{hasSharedBackend ? 'Changes update across your group’s phones through Firebase Firestore.' : 'This copy works on one device. Add Firebase environment variables before sending the link to friends.'}</p>
-        </div>
-      </section>
-    </main>
-  )
-}
-
-function NameModal({ currentName, onSave, canClose }) {
-  const [name, setName] = useState(currentName || '')
-  const [saving, setSaving] = useState(false)
-  const [error, setError] = useState('')
-
-  async function submit(event) {
-    event.preventDefault()
-    if (!name.trim()) return
-    setSaving(true)
-    setError('')
-    try {
-      await onSave(name)
-    } catch (err) {
-      setError(err.message || 'Could not save your name.')
-    } finally {
-      setSaving(false)
-    }
-  }
-
-  return (
-    <div className="modal-backdrop">
-      <form className="name-modal" onSubmit={submit}>
-        <div className="modal-plane"><Icon name="plane" size={34} /></div>
-        <span className="kicker">Join the trip board</span>
-        <h2>What should your friends see?</h2>
-        <p>Use a first name or nickname. This device will remember it.</p>
-        <label>
-          Display name
-          <input autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="Example: Dan" maxLength={40} />
-        </label>
-        {error && <p className="form-error">{error}</p>}
-        <button className="primary-button" type="submit" disabled={saving || !name.trim()}>{saving ? 'Joining…' : 'Join trip board'}</button>
-        {canClose && <small>Saving replaces your current display name.</small>}
-      </form>
-    </div>
-  )
-}
-
 function App() {
   const trip = useTripData()
   const [activeTab, setActiveTab] = useState('decisions')
   const [activeDay, setActiveDay] = useState('sat')
-  const [editingName, setEditingName] = useState(false)
   const [toast, setToast] = useState('')
 
   const upcomingDay = useMemo(() => {
@@ -1096,7 +905,7 @@ function App() {
   async function shareTrip() {
     const shareData = {
       title: TRIP_NAME,
-      text: 'Open our shared AirVenture schedule and decision board.',
+      text: 'Open our shared AirVenture schedule. Everyone sees and edits the same board.',
       url: window.location.href,
     }
     try {
@@ -1116,12 +925,10 @@ function App() {
       <div className="loading-screen">
         <div className="loading-plane"><Icon name="plane" size={42} /></div>
         <strong>Loading trip board</strong>
-        <span>Preparing schedule and group choices…</span>
+        <span>Connecting to the shared schedule…</span>
       </div>
     )
   }
-
-  const needsName = !trip.member || editingName
 
   return (
     <div className="app-shell">
@@ -1165,15 +972,6 @@ function App() {
       {activeTab === 'schedule' && (
         <ScheduleView activeDay={activeDay} member={trip.member} members={trip.members} votes={trip.votes} groupChoices={trip.groupChoices} onVote={trip.setVote} onClearGroupChoices={trip.clearGroupChoices} />
       )}
-      {activeTab === 'group' && (
-        <GroupView
-          member={trip.member}
-          members={trip.members}
-          votes={trip.votes}
-          groupChoices={trip.groupChoices}
-          onEditName={() => setEditingName(true)}
-        />
-      )}
 
       <nav className="bottom-nav" aria-label="Main navigation">
         <button className={activeTab === 'decisions' ? 'active' : ''} onClick={() => setActiveTab('decisions')}>
@@ -1182,21 +980,8 @@ function App() {
         <button className={activeTab === 'schedule' ? 'active' : ''} onClick={() => setActiveTab('schedule')}>
           <Icon name="calendar" /><span>Schedule</span>
         </button>
-        <button className={activeTab === 'group' ? 'active' : ''} onClick={() => setActiveTab('group')}>
-          <Icon name="people" /><span>Group</span>
-        </button>
       </nav>
 
-      {needsName && (
-        <NameModal
-          currentName={trip.member?.display_name}
-          canClose={Boolean(trip.member)}
-          onSave={async (name) => {
-            await trip.saveName(name)
-            setEditingName(false)
-          }}
-        />
-      )}
 
       {toast && <div className="toast" onAnimationEnd={() => setToast('')}>{toast}</div>}
     </div>
